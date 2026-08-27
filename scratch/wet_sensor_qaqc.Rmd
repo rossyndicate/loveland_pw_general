@@ -1,0 +1,173 @@
+---
+title: "WET Sensor QAQC"
+author: "Sam Struthers-CSU"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.dim = c(12,10))
+#Load Libraries and Plot theme
+source("src/setup_libraries.R")
+source("src/setup_ross_theme.R")
+library(ross.wq.tools)
+
+#functions for wet api pull
+source("src/data_collation/pull_wet_api_loveland.R")
+# Read in all files in src/sensor_qaqc
+walk(list.files("src/sensor_qaqc", full.names = TRUE), source)
+
+```
+
+# Goals
+
+1)  Determine how long the historical record is
+2)  Compute seasonal ranges for `ross.wq.tools` input
+3)  Run `ross.wq.tools` QAQC on the data and determine if this is sufficient to clean up data
+4)  Save this historical record to parquet for future use
+
+## Pull in the Recent Data from the WET API
+
+We can only pull in the last year's worth of data from the WET API, so we will pull in the last year of data for all sites and then combine it with the historical record we have in the `data/raw/sensor` folder.
+
+```{r}
+ sites <- c("reservoir_bypass", "sulzer_creek", "big_thompson_narrows", "north_fork")
+
+ current_wet_data <- map_dfr(sites,
+                        ~pull_wet_api_loveland(
+                          target_site = .x,
+                          start_datetime = ymd_hms("2025-01-01 12:00:00", tz = "MST"),
+                          end_datetime = Sys.time()
+                        ))
+ 
+ 
+ ggplot(current_wet_data, aes(x = DT_round_MT, y = value, color = site)) +
+   geom_line() +
+   facet_wrap(~ parameter, scales = "free_y") +
+   labs(title = "WET Data from Big Thompson Watershed",
+        x = "Date",
+        y = "Value",
+        color = "Parameter"   
+ )
+```
+
+```{r}
+# Read in historical data and munge
+#historical_data <- read_parquet("data/raw/sensor/historical_wet_data.parquet")
+historical_data <- tibble() #placeholder
+
+#Munge
+all_wet_data <- bind_rows(current_wet_data, historical_data)%>%
+  distinct()%>%
+  mutate(id = paste(site, parameter, sep = "_"), 
+         timestamp = DT_round)%>%
+  arrange(site, parameter, DT_round_MT)
+
+write_parquet(all_wet_data, "data/raw/sensor/historical_wet_data.parquet")
+```
+
+# Clean up and compute thresholds
+
+```{r}
+
+munged_wet_api <- munge_api_data(api_dir = "data/raw/sensor/")%>%
+  filter(parameter %nin% c("salinity", "Actual Conductivity"))%>%
+  split(f = list(.$site, .$parameter), sep = "-") %>%
+  keep(~nrow(.) > 0)%>%
+  map(~tidy_api_data(api_data = .)) %>%
+  map(., generate_summary_statistics)
+
+season_thresholds <- map_dfr(munged_wet_api, make_threshold_table)
+gc()
+
+```
+
+# Apply flags
+
+```{r}
+
+single_sensor_flags <- munged_wet_api %>%
+  map(., ~add_seasonal_flag(df = ., threshold_table = season_thresholds))%>%
+  #map(., ~add_repeat_flag(.))%>% # Because of rounding in WET system, this flag overflags real data, so we are not using it for now
+  map(., ~add_frozen_flag(.))%>%
+  map(.,  ~find_do_noise(df = .))%>%
+  map(., ~add_drift_flag(df = .))
+
+gc()
+
+intrasensor_flags <- single_sensor_flags %>%
+  rbindlist(fill = TRUE) %>%
+  split(by = "site")%>%
+  map(., ~intersensor_check(.) )%>%
+  map(.,  ~add_burial_flag(.))%>%
+  map(., ~add_unsubmerged_flag(., method = "sc"))%>% #Depth data is unreliable here so we can use our SC method to flag unsubmerged data (<10 us/cm)
+  rbindlist(fill = TRUE) %>%
+  mutate(flag = ifelse(flag == "", NA, flag)) %>%
+  split(f = list(.$site, .$parameter), sep = "-") %>%
+  keep(~nrow(.) > 0)
+
+#network list 
+site_order_list <- list(
+  "big_t" = c("north_fork", "big_thompson_narrows", "csu_canyon_mouth"),
+  "reservoir_bypass" = c("reservoir_bypass"),
+  "sulzer_creek" = c("sulzer_creek")
+)
+
+# apply network-level quality control
+network_flags <- intrasensor_flags%>%
+  # network check compares patterns across sites
+  purrr::map(~ross.wq.tools::network_check(df = ., intrasensor_flags_arg = intrasensor_flags,
+                            site_order_arg = site_order_list)) %>% # using site order list from above to determine network connectivity
+  rbindlist(fill = TRUE) %>%
+  # clean up flag column formatting
+  tidy_flag_column() %>%
+  split(f = list(.$site, .$parameter), sep = "-") %>%
+  # add suspect data flags for isolated anomalies
+  purrr::map(~add_suspect_flag(.)) %>%
+  rbindlist(fill = TRUE)
+
+```
+
+# Quick Plots to assess quality
+
+```{r}
+plots <- network_flags %>%
+  split(.$parameter) %>%
+  map(~ {
+    ggplot(.x, aes(x = DT_round, y = mean, color = flag)) +
+      geom_point() +
+      facet_wrap(~site, scales = "free_y") +
+      labs(title = unique(.x$parameter))
+  })
+
+walk(plots, print)
+
+```
+
+Seems like in general, things are working as we would expect! Couple of notes:
+
+- I dropped actual conductivity and salinity from this workflow since they are just transformed SC
+
+- We have Chl-a Fluorescence at Sulzer and Chlorophyll (ug/L) at the other sites
+
+- Depth is only at the Narrows site and seems to be quite wonky. We probably want to use SC as our depth/submerged check
+
+- DO interference/ burial seems to be overflagging slightly so we may want to remove that flag
+
+- Ideally we can get more years of data so our seasonal ranges are not so tight
+
+- Hydrocarbon appears to be very overflagged but I am unfamiliar with this parameter so maybe that is normal?
+
+- Network check does appear to help with the Big Thompson sites and we may want to use it for the two sondes on the canal
+
+## Save Files
+
+```{r}
+#save the seasonal thresholds to the derived data folder
+write_parquet(season_thresholds, "data/derived/sensor_qaqc/seasonal_thresholds_20260825.parquet")
+#save the flagged data to the collated folder
+network_flags%>%
+  select(site:flag, auto_flag)%>%
+  write_parquet("data/collated/sensor/flagged_wet_data_20260825.parquet")
+
+```

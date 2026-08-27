@@ -1,0 +1,9 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+
+/creds
+/data
+#Hide .DS_Store
+**.DS_Store
